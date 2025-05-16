@@ -1,0 +1,5 @@
+[2025-05-16 07:10:04,680][__main__][INFO] - Starting Eval.
+[2025-05-16 07:10:05,795][dataloader][INFO] - Generating new data at: /share/kuleshov/ssahoo/textdiffusion/data/openwebtext-valid_validation_bs1024_wrapped_specialFalse.dat
+[2025-05-16 07:10:05,795][dataloader][INFO] - streaming=False
+[2025-05-16 07:27:00,558][datasets.arrow_dataset][WARNING] - num_proc must be <= 10. Reducing num_proc to 10 for dataset of size 10.
+[2025-05-16 07:27:01,547][datasets.arrow_dataset][WARNING] - num_proc must be <= 10. Reducing num_proc to 10 for dataset of size 10.

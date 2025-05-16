@@ -1,0 +1,12 @@
+- loader.eval_batch_size=16
+- model=small
+- algo=bd3lm
+- algo.backbone=hf_dit
+- data=openwebtext-split
+- data.insert_valid_special=False
+- model.length=1024
+- model.attn_backend=flex
+- block_size=4
+- eval.checkpoint_path=kuleshov-group/bd3lm-owt-block_size4
+- wandb=null
+- mode=ppl_eval

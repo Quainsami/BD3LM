@@ -1,0 +1,33 @@
+name: bd3lm
+backbone: dit  # dit / dimamba / hf_dit
+parameterization: subs
+time_conditioning: False
+T: 0  # 0 (continuous time) / 1000 
+causal_attention: False
+dropout: 0.0
+ignore_bos: True
+cross_attn: True
+var_min: True
+clip_search_delta: 0.05
+clip_search_widths: []
+fix_clipping: False
+sampler: semi_ar
+mdlm_loss_scale: False
+
+
+base_noise_type: cosine # Or loglinear, etc.
+schedule_clamp_epsilon: 1.0e-6 # For clamping alpha_bar_base before logit
+
+lambda_steps_penalty: 0.01 # Weight for the surrogate steps penalty
+min_alpha_1_target: 0.005  # Target for alpha_b(1) floor penalty (e.g. alpha_b(1) >= 0.005)
+lambda_min_alpha_1_penalty: 1.0 # Weight for the floor penalty on alpha_b(1)
+alpha_1_clamp_min: 1.0e-5    # Clamping for -log(alpha_b(1))
+alpha_1_clamp_max: 0.99999   # Clamping for -log(alpha_b(1))
+
+lambda_s_b_l2_penalty: 0.0 # Optional L2 penalty on log_s_tilde
+
+meta_controller:
+  feature_dim: 1 # Change this based on _get_block_features
+  hidden_dim: 64
+  s_tilde_squash_factor: 4.0
+  s_min_epsilon: 0.01

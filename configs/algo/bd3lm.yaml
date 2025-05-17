@@ -26,8 +26,10 @@ alpha_1_clamp_max: 0.99999   # Clamping for -log(alpha_b(1))
 
 lambda_s_b_l2_penalty: 0.0 # Optional L2 penalty on log_s_tilde
 
+feature_extractor_model_name: "distilbert-base-uncased" # Optional: make it configurable
+
 meta_controller:
-  feature_dim: 1 # Change this based on _get_block_features
-  hidden_dim: 64
+  feature_dim: 771 # IMPORTANT: Update this! Example for distilbert-base + 3 scalar features.
+  hidden_dim: 128   # Example hidden dimension for the controller MLP
   s_tilde_squash_factor: 4.0
   s_min_epsilon: 0.01

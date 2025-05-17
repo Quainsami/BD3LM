@@ -12,14 +12,22 @@ from collections import OrderedDict
 
 import dataloader
 import metrics
-import models
+import models # Assuming models.__init__ properly imports dit, ema, and potentially dimamba
 import noise_schedule
-import utils
-import numpy as np
-import itertools
-from omegaconf import ListConfig # <--- ADD THIS LINE
+import utils # Ensure utils.py is present and correct
+# numpy and itertools are imported again, can be removed if already at top level of module
+# import numpy as np 
+# import itertools 
+from omegaconf import ListConfig, OmegaConf # Added OmegaConf
 
 from models.meta_controller import MetaController
+
+# For feature extraction in __init__
+from transformers import AutoModel, AutoTokenizer # Ensure these are at the top with other transformers imports
+import spacy
+import benepar # Needs nltk.download('punkt') and benepar.download('benepar_en3')
+from nltk.tree import Tree # For parsing benepar's output string
+
 
 def _sample_categorical(categorical_probs):
   gumbel_norm = (1e-10 - (torch.rand_like(categorical_probs) + 1e-10).log())
@@ -42,7 +50,7 @@ class Diffusion(L.LightningModule):
     def __init__(self, config, tokenizer: transformers.PreTrainedTokenizer):
         super().__init__()
         self.save_hyperparameters()
-        self.config = config
+        self.config = config 
         self.tokenizer = tokenizer
 
         self.vocab_size = self.tokenizer.vocab_size
@@ -57,6 +65,7 @@ class Diffusion(L.LightningModule):
           self.vocab_size += 1
         else:
           self.mask_index = self.tokenizer.mask_token_id
+
         if hasattr(self.config, 'algo'):
           self.parameterization = self.config.algo.parameterization
         else:
@@ -67,11 +76,15 @@ class Diffusion(L.LightningModule):
           self.block_size = self.config.model.length
         if self.parameterization == 'ar':
           self.block_size = 1
+        
+        # Backbone initialization
         if self.config.algo.backbone == 'dit':
           self.backbone = models.dit.DIT(
             self.config, vocab_size=self.vocab_size)
         elif self.config.algo.backbone == 'dimamba':
-          self.backbone = models.dimamba.DiMamba(
+          if not hasattr(models, 'dimamba') or not hasattr(models.dimamba, 'DiMamba'): # Guard import
+              raise ImportError("models.dimamba.DiMamba not found. Please ensure it's correctly defined and imported via models/__init__.py or directly.")
+          self.backbone = models.dimamba.DiMamba(  
             self.config,
             vocab_size=self.vocab_size,
             pad_token_id=self.tokenizer.pad_token_id)
@@ -81,24 +94,20 @@ class Diffusion(L.LightningModule):
           if getattr(self.backbone.config, 'attn_backend', None) == 'flex' and \
             self.config.model.attn_backend == 'sdpa':
             self.backbone.config.attn_backend = 'sdpa'
-            for i in self.backbone.backbone.blocks:
-              i.attn_backend = 'sdpa'
-            self.backbone.backbone.gen_mask(self.config.model.length, self.block_size, attn_backend='sdpa')
+            if hasattr(self.backbone, 'backbone') and hasattr(self.backbone.backbone, 'blocks'): # Check structure
+                for i_block_internal in self.backbone.backbone.blocks: 
+                    i_block_internal.attn_backend = 'sdpa'
+                if hasattr(self.backbone.backbone, 'gen_mask'):
+                    self.backbone.backbone.gen_mask(self.config.model.length, self.block_size, attn_backend='sdpa')
+            else:
+                print("Warning: hf_dit backbone structure for attn_backend patching not as expected in Diffusion.__init__.")
         else:
           raise ValueError(f'Unknown backbone: {self.config.algo.backbone}')
 
         self.T = self.config.algo.T
         self.num_tokens = self.config.model.length
-
         self.noise = noise_schedule.get_noise(self.config)
         self.metrics = metrics.Metrics(config)
-
-        if self.config.training.ema > 0:
-          self.ema = models.ema.ExponentialMovingAverage(
-            self._get_parameters(), 
-            decay=self.config.training.ema)
-        else:
-          self.ema = None
 
         self.var_min = self.config.algo.var_min
         if self.var_min:
@@ -112,8 +121,68 @@ class Diffusion(L.LightningModule):
         self.fast_forward_epochs = None
         self.fast_forward_batches = None
         
-        self.meta_controller_config = config.algo.meta_controller 
-        self.meta_controller = MetaController(config) 
+        # --- Feature Extractor: DistilBERT ---
+        self.distilbert_model_name = getattr(config.algo, "feature_extractor_model_name", "distilbert-base-uncased")
+        try:
+            self.distilbert_tokenizer = AutoTokenizer.from_pretrained(self.distilbert_model_name)
+            self.distilbert_model = AutoModel.from_pretrained(self.distilbert_model_name)
+            self.distilbert_model.eval()
+            for param in self.distilbert_model.parameters():
+                param.requires_grad = False
+            self.distilbert_hidden_size = self.distilbert_model.config.hidden_size
+            print(f"Successfully loaded DistilBERT model '{self.distilbert_model_name}' (Hidden: {self.distilbert_hidden_size}).")
+        except Exception as e:
+            print(f"Warning: Could not load DistilBERT '{self.distilbert_model_name}'. Semantic features will be zero. Error: {e}")
+            self.distilbert_tokenizer = None
+            self.distilbert_model = None
+            self.distilbert_hidden_size = 768 # Fallback default for 'distilbert-base-uncased'
+
+        # --- Feature Extractor: SpaCy + Benepar for Syntactic Depth ---
+        self.spacy_model_name = getattr(config.algo, "spacy_model_name", "en_core_web_sm")
+        self.benepar_model_name = getattr(config.algo, "benepar_model_name", "benepar_en3")
+        try:
+            self.nlp = spacy.load(self.spacy_model_name, exclude=["ner", "lemmatizer"])
+            if not self.nlp.has_pipe("benepar"):
+                if spacy.__version__.startswith("2"):
+                    self.nlp.add_pipe(benepar.BeneparComponent(self.benepar_model_name))
+                else: # SpaCy v3+
+                    self.nlp.add_pipe("benepar", config={"model": self.benepar_model_name})
+            print(f"Successfully loaded spaCy model '{self.spacy_model_name}' and benepar model '{self.benepar_model_name}'.")
+        except Exception as e:
+            print(f"Warning: Could not load spaCy/benepar. Syntactic depth feature will be zero. Error: {e}")
+            if isinstance(e, OSError) and (self.spacy_model_name in str(e) or "Can't find model" in str(e)): # More specific check
+                 print(f"Please run: python -m spacy download {self.spacy_model_name}")
+            elif "benepar" in str(e).lower() or "punkt" in str(e).lower():
+                 print("Please ensure NLTK 'punkt' and the Benepar model are downloaded: \n"
+                       "import nltk; nltk.download('punkt');\n"
+                       "import benepar; benepar.download('benepar_en3') (or your specified model)")
+            self.nlp = None
+            
+        # Define the dimensions of each part of the feature vector
+        self.feature_dim_parts = {
+            "pos_ratio": 1,
+            "semantic": self.distilbert_hidden_size if self.distilbert_model is not None else 0,
+            "block_entropy": 1,
+            "token_variance": 1,
+            "syntactic_depth": 1 if self.nlp is not None else 0,
+            "context_entropy": 1,
+        }
+        calculated_feature_dim = sum(self.feature_dim_parts.values())
+        
+        # Create a mutable copy of the meta_controller config for this instance
+        original_mc_config_dict = OmegaConf.to_container(config.algo.meta_controller, resolve=True)
+        current_meta_controller_config_obj = OmegaConf.create(original_mc_config_dict)
+
+        if current_meta_controller_config_obj.feature_dim != calculated_feature_dim:
+            print(f"ADJUSTING MetaController 'feature_dim': Config had {current_meta_controller_config_obj.feature_dim}, "
+                  f"but calculated {calculated_feature_dim} based on available feature extractors. Using calculated value.")
+            print(f"Calculated breakdown: {self.feature_dim_parts}")
+            current_meta_controller_config_obj.feature_dim = calculated_feature_dim
+        
+        self.meta_controller_config = current_meta_controller_config_obj
+        
+        temp_config_for_mc_init = OmegaConf.create({'algo': {'meta_controller': self.meta_controller_config}})
+        self.meta_controller = MetaController(temp_config_for_mc_init)
 
         self.base_noise_schedule = noise_schedule.get_noise(config, config.algo.base_noise_type)
         
@@ -130,13 +199,41 @@ class Diffusion(L.LightningModule):
         
         self.lambda_steps_penalty = self.config.algo.lambda_steps_penalty
         
-        if hasattr(self.config.algo, 'lambda_s_b_l2_penalty'):
-            self.lambda_s_b_l2_penalty = self.config.algo.lambda_s_b_l2_penalty
-        else:
-            self.lambda_s_b_l2_penalty = 0.0
+        self.lambda_s_b_l2_penalty = getattr(self.config.algo, 'lambda_s_b_l2_penalty', 0.0)
             
+        if self.config.training.ema > 0:
+          self.ema = models.ema.ExponentialMovingAverage(
+            self._get_parameters(), 
+            decay=self.config.training.ema)
+        else:
+          self.ema = None
+
         self._validate_configuration()
 
+    # ... (The rest of the Diffusion class methods from the previous response should follow here)
+    # Make sure the _get_block_features method is the one provided in the corrected response
+    # which handles all feature calculations (position, semantic, block_entropy, 
+    # token_variance, syntactic_depth, context_entropy).
+
+    # ... (The rest of the Diffusion class methods: _get_parameters, _get_parse_tree_height, 
+    #      _get_block_features, _get_warped_noise_outputs_for_block_batch, on_validation_model_zero_grad,
+    #      _validate_configuration, to, _replace_ckpt_keys, on_load_checkpoint, on_save_checkpoint,
+    #      on_train_start, optimizer_step, _subs_parameterization, _sedd_parameterization,
+    #      _process_sigma, forward, on_train_epoch_start, training_step, on_validation_epoch_start,
+    #      on_validation_epoch_end, _check_val_sampling_intvl, validation_step, configure_optimizers,
+    #      _resample_q_xt, q_xt, _sample_prior, _nucleus_sample, _ddpm_caching_update,
+    #      _ar_sampler, _check_stop_conds_ar_batch, _sample, _sigma_from_p,
+    #      restore_model_and_sample, get_score, _staggered_score, _analytic_update,
+    #      _denoiser_update, _transp_transition, _sample_t, _maybe_sub_sample, _loss,
+    #      _clipped_schedule_search, _score_entropy, _analytic_sampler, _semi_ar_sampler,
+    #      _compute_entropy, _check_stop_conds)
+    # 
+    # IMPORTANT: Ensure the `_get_block_features` method is the one provided in the previous good response,
+    # which includes all feature calculations (position, semantic, block entropy, token variance, 
+    # syntactic depth, context entropy).
+    
+    # ... (rest of the Diffusion class methods: _get_parameters, _get_parse_tree_height, _get_block_features, etc.)
+    # Ensure _get_block_features is the corrected version from the previous response.
     def _get_parameters(self):
         params_to_optimize = []
         training_stage = getattr(self.config.training, "stage", "joint") 
@@ -160,23 +257,155 @@ class Diffusion(L.LightningModule):
 
         return itertools.chain(*params_to_optimize)
 
+    def _get_parse_tree_height(self, parse_string: str) -> int:
+        """Calculates the height of a PTB-style parse tree string."""
+        if not parse_string or not parse_string.startswith("("):
+            return 0
+        try:
+            tree = Tree.fromstring(parse_string)
+            return tree.height()
+        except ValueError: # Error parsing the string
+            return 0 # Or some other default/indicator for parse failure
+
     def _get_block_features(self, tokens: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         B, N_Tokens = tokens.shape
-        if self.block_size == 0: 
-            return torch.empty(B, 0, self.meta_controller_config.feature_dim, device=tokens.device)
+        target_feature_dim = self.meta_controller_config.feature_dim
+
+        if self.block_size == 0 or N_Tokens == 0 :
+            return torch.empty(B, 0, target_feature_dim, device=tokens.device, dtype=torch.float32)
+
         num_blocks = N_Tokens // self.block_size
-        if num_blocks == 0: 
-             return torch.empty(B, 0, self.meta_controller_config.feature_dim, device=tokens.device)
+        if num_blocks == 0:
+             return torch.empty(B, 0, target_feature_dim, device=tokens.device, dtype=torch.float32)
 
+        if N_Tokens % self.block_size != 0:
+            # This should ideally be handled by _maybe_sub_sample or the calling logic
+            # For feature extraction, we'll work with the largest number of full blocks
+            N_Tokens_for_feat = num_blocks * self.block_size
+            print(f"Warning (_get_block_features): N_Tokens ({N_Tokens}) not multiple of block_size ({self.block_size}). "
+                  f"Using first {N_Tokens_for_feat} tokens for feature calculation.")
+            tokens_for_feat = tokens[:, :N_Tokens_for_feat]
+        else:
+            tokens_for_feat = tokens
 
-        block_indices_feat = torch.arange(num_blocks, device=tokens.device, dtype=torch.float32)
-        if num_blocks > 1:
-            block_indices_feat = block_indices_feat / (num_blocks - 1 + 1e-9) 
-        else: 
-            block_indices_feat = torch.zeros_like(block_indices_feat)
+        block_tokens_view = tokens_for_feat.reshape(B, num_blocks, self.block_size)
+
+        # --- Initialize feature tensors ---
+        # These can be computed in a batched way across blocks for a given batch item
+        pos_ratio_feat = torch.zeros(B, num_blocks, self.feature_dim_parts["pos_ratio"], device=tokens.device, dtype=torch.float32)
+        semantic_feat = torch.zeros(B, num_blocks, self.feature_dim_parts["semantic"], device=tokens.device, dtype=torch.float32)
+        block_entropy_feat = torch.zeros(B, num_blocks, self.feature_dim_parts["block_entropy"], device=tokens.device, dtype=torch.float32)
+        token_variance_feat = torch.zeros(B, num_blocks, self.feature_dim_parts["token_variance"], device=tokens.device, dtype=torch.float32)
+        syntactic_depth_feat = torch.zeros(B, num_blocks, self.feature_dim_parts["syntactic_depth"], device=tokens.device, dtype=torch.float32)
+        context_entropy_feat = torch.zeros(B, num_blocks, self.feature_dim_parts["context_entropy"], device=tokens.device, dtype=torch.float32)
+
+        # --- 1. Position Ratio (Batched) ---
+        if self.feature_dim_parts["pos_ratio"] > 0:
+            block_indices_vals = torch.arange(num_blocks, device=tokens.device, dtype=torch.float32)
+            if num_blocks > 1:
+                pos_ratio_unexpanded = block_indices_vals / (num_blocks - 1 + 1e-9)
+            else:
+                pos_ratio_unexpanded = torch.zeros_like(block_indices_vals)
+            pos_ratio_feat_expanded = pos_ratio_unexpanded.view(1, num_blocks, 1).expand(B, -1, -1)
+            pos_ratio_feat.copy_(pos_ratio_feat_expanded)
+
+        # --- 2. Semantic Features (DistilBERT - Batched) ---
+        if self.distilbert_model is not None and self.distilbert_tokenizer is not None and self.feature_dim_parts["semantic"] > 0:
+            flat_block_token_ids = block_tokens_view.reshape(B * num_blocks, self.block_size)
+            block_texts_flat = [
+                self.tokenizer.decode(ids.cpu().tolist(), skip_special_tokens=True).strip() or self.distilbert_tokenizer.pad_token
+                for ids in flat_block_token_ids # Iterate over CPU list for tokenizer
+            ]
+            distilbert_inputs = self.distilbert_tokenizer(
+                block_texts_flat, padding='longest', truncation=True,
+                max_length=self.distilbert_tokenizer.model_max_length, return_tensors="pt"
+            ).to(self.distilbert_model.device)
+            with torch.no_grad():
+                distilbert_outputs = self.distilbert_model(**distilbert_inputs)
+            cls_embeddings_flat = distilbert_outputs.last_hidden_state[:, 0, :]
+            semantic_feat_computed = cls_embeddings_flat.reshape(B, num_blocks, self.distilbert_hidden_size).to(tokens.device)
+            semantic_feat.copy_(semantic_feat_computed)
+
+        # --- Features computed per batch item (due to sequential dependencies or CPU ops) ---
+        for b_idx in range(B):
+            accumulated_context_tokens_list = [] # Python list for efficient append
+            for blk_idx in range(num_blocks):
+                current_block_token_ids = block_tokens_view[b_idx, blk_idx] # Shape: (Blk_Size)
+
+                # --- 3. Block Entropy ---
+                if self.feature_dim_parts["block_entropy"] > 0 and current_block_token_ids.numel() > 0:
+                    _, counts = torch.unique(current_block_token_ids, return_counts=True)
+                    if counts.sum() > 0:
+                        probs = counts.float() / counts.sum()
+                        block_entropy_feat[b_idx, blk_idx, 0] = torch.special.entr(probs).sum()
+
+                # --- 4. Token Variance ---
+                if self.feature_dim_parts["token_variance"] > 0 and current_block_token_ids.numel() > 0:
+                    token_variance_feat[b_idx, blk_idx, 0] = current_block_token_ids.float().var(unbiased=False)
+                
+                # --- 5. Syntactic Depth ---
+                if self.nlp is not None and self.feature_dim_parts["syntactic_depth"] > 0:
+                    # Decode on CPU, parse on CPU
+                    block_text = self.tokenizer.decode(current_block_token_ids.cpu().tolist(), skip_special_tokens=True).strip()
+                    avg_depth = 0.0
+                    if block_text:
+                        doc = self.nlp(block_text) # spaCy processes on CPU
+                        sentence_depths = []
+                        num_valid_sents_for_depth = 0
+                        for sent in doc.sents:
+                            if hasattr(sent._, 'parse_string') and sent._.parse_string: # benepar parse available
+                                parse_str = sent._.parse_string 
+                                height = self._get_parse_tree_height(parse_str)
+                                if height > 0: # Successfully parsed and got a height
+                                    sentence_depths.append(height)
+                                    num_valid_sents_for_depth +=1
+                        if num_valid_sents_for_depth > 0:
+                            avg_depth = sum(sentence_depths) / num_valid_sents_for_depth
+                    syntactic_depth_feat[b_idx, blk_idx, 0] = avg_depth
+                
+                # --- 6. Context Entropy (of preceding blocks) ---
+                if self.feature_dim_parts["context_entropy"] > 0:
+                    if blk_idx > 0 and accumulated_context_tokens_list:
+                        # Convert list to tensor for entropy calculation for this block's context
+                        context_tensor = torch.tensor(accumulated_context_tokens_list, device=tokens.device, dtype=torch.long)
+                        if context_tensor.numel() > 0:
+                            _, counts = torch.unique(context_tensor, return_counts=True)
+                            if counts.sum() > 0:
+                                probs = counts.float() / counts.sum()
+                                context_entropy_feat[b_idx, blk_idx, 0] = torch.special.entr(probs).sum()
+                    # For blk_idx == 0, context_entropy_feat remains 0 by initialization.
+
+                # Update accumulated context for *next* block's context_entropy calculation
+                if self.feature_dim_parts["context_entropy"] > 0: # Only accumulate if feature is used
+                    accumulated_context_tokens_list.extend(current_block_token_ids.cpu().tolist())
         
-        block_indices_feat = block_indices_feat.view(1, num_blocks, 1).expand(B, -1, -1)
-        return block_indices_feat
+        # --- Concatenate all feature tensors ---
+        # Order should be consistent with self.feature_dim_parts for clarity,
+        # though MetaController only cares about the total final dimension.
+        all_features_collected = []
+        if self.feature_dim_parts["pos_ratio"] > 0: all_features_collected.append(pos_ratio_feat)
+        all_features_collected.append(semantic_feat)
+        if self.feature_dim_parts["block_entropy"] > 0: all_features_collected.append(block_entropy_feat)
+        if self.feature_dim_parts["token_variance"] > 0: all_features_collected.append(token_variance_feat)
+        if self.feature_dim_parts["syntactic_depth"] > 0: all_features_collected.append(syntactic_depth_feat)
+        if self.feature_dim_parts["context_entropy"] > 0: all_features_collected.append(context_entropy_feat)
+
+        if not all_features_collected:
+            print("Warning (_get_block_features): No features were computed. Returning zeros.")
+            return torch.zeros(B, num_blocks, target_feature_dim, device=tokens.device, dtype=torch.float32)
+
+        final_features_cat = torch.cat(all_features_collected, dim=-1)
+        
+        if final_features_cat.shape[-1] != target_feature_dim:
+            raise ValueError(
+                f"CRITICAL Dimension Mismatch for MetaController features: "
+                f"Concatenated feature dimension is {final_features_cat.shape[-1]}, "
+                f"but MetaController expects {target_feature_dim}. "
+                f"Calculated feature_dim_parts: {self.feature_dim_parts} (sum: {sum(self.feature_dim_parts.values())}). "
+                "Ensure YAML config for `meta_controller.feature_dim` is correct."
+            )
+        return final_features_cat
+
 
     def _get_warped_noise_outputs_for_block_batch(
         self,
@@ -243,6 +472,10 @@ class Diffusion(L.LightningModule):
         if hasattr(self, 'sampling_eps_min') and torch.is_tensor(self.sampling_eps_min):
           self.sampling_eps_min = self.sampling_eps_min.to(*args, **kwargs)
           self.sampling_eps_max = self.sampling_eps_max.to(*args, **kwargs)
+        
+        if hasattr(self, 'distilbert_model') and self.distilbert_model is not None:
+            self.distilbert_model = self.distilbert_model.to(*args, **kwargs)
+
         if hasattr(self, 'meta_controller'):
             self.meta_controller = self.meta_controller.to(*args, **kwargs)
         if hasattr(self, 'target_alpha_at_0'):
@@ -334,6 +567,13 @@ class Diffusion(L.LightningModule):
 
 
     def on_train_start(self):
+        # Initialize EMA here, now that _get_parameters will work correctly.
+        if self.config.training.ema > 0 and self.ema is None:
+            self.ema = models.ema.ExponentialMovingAverage(
+                self._get_parameters(), 
+                decay=self.config.training.ema
+            )
+            
         if self.ema:
           self.ema.move_shadow_params_to_device(self.device)
         
@@ -389,7 +629,8 @@ class Diffusion(L.LightningModule):
             for param in self.meta_controller.parameters():
                 param.requires_grad = True
         
-        if self.ema: 
+        # Re-initialize EMA if stage changes or if it wasn't set before.
+        if self.config.training.ema > 0: 
             self.ema = models.ema.ExponentialMovingAverage(
                 self._get_parameters(), decay=self.config.training.ema
             )
@@ -539,7 +780,7 @@ class Diffusion(L.LightningModule):
             main_val_metric_collection.reset()
 
 
-        if isinstance(self.config.training.sampling_eps, tuple):
+        if isinstance(self.config.training.sampling_eps, (tuple, ListConfig)):
             self.sampling_eps_min_val_current = torch.tensor(self.config.training.sampling_eps[0], device=self.device, dtype=torch.float32)
             self.sampling_eps_max_val_current = torch.tensor(self.config.training.sampling_eps[1], device=self.device, dtype=torch.float32)
         else: 
@@ -657,7 +898,6 @@ class Diffusion(L.LightningModule):
                                      sampling_eps_max=current_sampling_eps_max_for_val)
             self.metrics.valid_nlls.update(losses_fallback.nlls.detach(), losses_fallback.token_mask.detach())
             loss_to_return = losses_fallback.loss
-            # print("Warning: loss_to_return was None in validation_step, used fallback.")
 
 
         return loss_to_return 
@@ -753,8 +993,6 @@ class Diffusion(L.LightningModule):
             if not violations.any():
                 break 
             if _iter == max_resample_iters - 1 and violations.any():
-                # print(f"Warning: Max resamples ({max_resample_iters}) reached in _resample_q_xt, bounds may still be violated.")
-                # print(f"Rates: {final_mask_rate}, Min: {sampling_eps_min_val}, Max: {sampling_eps_max_val}")
                 pass
         return xt_blocks
 
@@ -803,9 +1041,6 @@ class Diffusion(L.LightningModule):
                 xt = xt_blocks_resampled.reshape(xt.shape[0], -1)
         return xt
     
-    # Methods from _sample_prior downwards can be copied from the previous correct version.
-    # Ensure they are consistent with any changes made above, particularly device handling
-    # and how `self.forward` is called.
     @torch.no_grad()
     def _sample_prior(self, *batch_dims):
         return self.mask_index * torch.ones(
@@ -1297,21 +1532,17 @@ class Diffusion(L.LightningModule):
             if hasattr(self, 'sampling_eps_min') and isinstance(self.sampling_eps_min, torch.Tensor):
                 current_sampling_eps_min = self.sampling_eps_min
                 current_sampling_eps_max = self.sampling_eps_max
-            # MODIFIED PART HERE
             elif isinstance(self.config.training.sampling_eps, (tuple, ListConfig)) and len(self.config.training.sampling_eps) == 2:
                 current_sampling_eps_min = torch.tensor(self.config.training.sampling_eps[0], device=x0.device, dtype=torch.float32)
                 current_sampling_eps_max = torch.tensor(self.config.training.sampling_eps[1], device=x0.device, dtype=torch.float32)
             elif not isinstance(self.config.training.sampling_eps, (tuple, ListConfig)): # scalar case
                 current_sampling_eps_min = torch.tensor(self.config.training.sampling_eps, device=x0.device, dtype=torch.float32)
                 current_sampling_eps_max = torch.tensor(1.0, device=x0.device, dtype=torch.float32) # Default max if only min is scalar
-            else: # Should not happen if config is (float, float) or float
+            else: 
                 raise ValueError(f"Unexpected type/format for self.config.training.sampling_eps: {self.config.training.sampling_eps}")
-
         else:
             current_sampling_eps_min = sampling_eps_min.to(x0.device) if isinstance(sampling_eps_min, torch.Tensor) else torch.tensor(sampling_eps_min, device=x0.device, dtype=torch.float32)
             current_sampling_eps_max = sampling_eps_max.to(x0.device) if isinstance(sampling_eps_max, torch.Tensor) else torch.tensor(sampling_eps_max, device=x0.device, dtype=torch.float32)
-
-
 
         input_tokens, _, new_attention_mask = self._maybe_sub_sample(x0, attention_mask)
         B, N_Tokens = input_tokens.shape
@@ -1319,7 +1550,6 @@ class Diffusion(L.LightningModule):
             return Loss(loss=torch.tensor(0.0, device=x0.device, requires_grad=True), 
                         nlls=torch.empty((B,0), device=x0.device), 
                         token_mask=torch.empty((B,0), device=x0.device))
-
 
         if self.parameterization == 'bd3lm':
             if self.block_size == 0 or N_Tokens < self.block_size or N_Tokens % self.block_size != 0: 
@@ -1339,12 +1569,11 @@ class Diffusion(L.LightningModule):
                     _dummy_nll_term = -torch.gather(_dummy_log_probs, -1, input_tokens.unsqueeze(-1)).squeeze(-1)
                     _dummy_masked_nll = (_dummy_nll_term * new_attention_mask)
                     _dummy_mean_nll = _dummy_masked_nll.sum() / new_attention_mask.sum().clamp(min=1.0)
-                 else: # Should not happen given N_Tokens == 0 check earlier
+                 else: 
                     _dummy_mean_nll = torch.tensor(0.0, device=x0.device, requires_grad=True)
                     _dummy_nll_term = torch.empty((B,0), device=x0.device)
 
                  return Loss(loss=_dummy_mean_nll, nlls=_dummy_nll_term, token_mask=new_attention_mask)
-
 
             N_Blk = N_Tokens // self.block_size
             x0_block_features = self._get_block_features(input_tokens, new_attention_mask) 
@@ -1364,12 +1593,10 @@ class Diffusion(L.LightningModule):
             loss_scale_per_token = loss_scale_b_u_all_blocks.repeat_interleave(self.block_size, dim=1)
             
             sigma_all_tokens_for_backbone = self._sigma_from_p(p_per_token) 
-            # Pass sigma_all_tokens_for_backbone (B,N_T) to _process_sigma, it expects (B,N_T) or (B,N_T,1)
-            processed_sigma_for_backbone = self._process_sigma(sigma_all_tokens_for_backbone) 
-
+            # processed_sigma_for_backbone = self._process_sigma(sigma_all_tokens_for_backbone) # This will be done inside self.forward
 
             xt = self.q_xt(input_tokens,
-                           p_per_token.unsqueeze(-1), 
+                           p_per_token.unsqueeze(-1), # q_xt expects p to be suitable for broadcasting or per-token
                            block_size=self.block_size, 
                            sampling_eps_min=current_sampling_eps_min, 
                            sampling_eps_max=current_sampling_eps_max)
@@ -1381,8 +1608,7 @@ class Diffusion(L.LightningModule):
             if self.cross_attn:
                 x_model_input = torch.cat((xt, input_tokens), dim=-1)
 
-            # Pass sigma_all_tokens_for_backbone to self.forward, it will call _process_sigma internally
-            model_output_logits = self.forward(x_model_input, sigma=sigma_all_tokens_for_backbone) 
+            model_output_logits = self.forward(x_model_input, sigma=sigma_all_tokens_for_backbone) # Pass raw sigma here
             
             log_probs_x0 = F.log_softmax(model_output_logits, dim=-1)
             log_p_theta_x0_given_xt_per_token = torch.gather(log_probs_x0, -1, input_tokens.unsqueeze(-1)).squeeze(-1)
@@ -1390,19 +1616,19 @@ class Diffusion(L.LightningModule):
             nelbo_term_per_token = loss_scale_per_token * log_p_theta_x0_given_xt_per_token 
             
             s_b_for_penalty_device = s_b_for_penalty.to(self.device)
-            base_alpha_bar_at_1_for_penalty = self.base_noise_schedule.get_alpha_bar(
-                torch.ones_like(s_b_for_penalty_device.squeeze(-1)) 
-            ) 
+            alpha_b_at_1_arg_t = torch.ones_like(s_b_for_penalty_device.squeeze(-1)) # Should be (B, N_Blk)
+            base_alpha_bar_at_1_for_penalty = self.base_noise_schedule.get_alpha_bar(alpha_b_at_1_arg_t) # (B, N_Blk)
             
+            # get_warped_alpha_b_t expects s_b to be (B, N_Blk, 1) or broadcastable with base_alpha_bar_t
             _alpha_b_at_1_warped = noise_schedule.get_warped_alpha_b_t(
-                base_alpha_bar_at_1_for_penalty,
-                self.base_log_alpha_bar_at_0,        
-                s_b_for_penalty_device,       
-                torch.logit(self.target_alpha_at_0.to(base_alpha_bar_at_1_for_penalty.device)) 
-            ) 
+                base_alpha_bar_at_1_for_penalty, # (B, N_Blk)
+                self.base_log_alpha_bar_at_0, # Scalar
+                s_b_for_penalty_device,  # (B, N_Blk, 1)
+                torch.logit(self.target_alpha_at_0.to(base_alpha_bar_at_1_for_penalty.device)) # Scalar
+            ) # Output should be (B, N_Blk)
 
             surrogate_penalty_per_block = noise_schedule.compute_surrogate_steps_penalty(
-                _alpha_b_at_1_warped, 
+                _alpha_b_at_1_warped, # (B, N_Blk)
                 self.min_alpha_1_target,
                 self.lambda_min_alpha_1_penalty,
                 self.alpha_1_clamp_min,
@@ -1435,18 +1661,10 @@ class Diffusion(L.LightningModule):
 
             output_ar = self.forward(input_tokens, None) 
             
-            # Determine target based on original x0 and how input_tokens was derived
-            if x0.shape[1] > input_tokens.shape[1]: # input_tokens was result of subsampling
-                # This case is complex for AR, as output_ar corresponds to input_tokens
-                # Need to ensure target aligns with input_tokens context.
-                # Simple approach: target is next token for each token in input_tokens, from original x0
-                # This requires knowing the start index of input_tokens within x0 if _maybe_sub_sample changed it.
-                # For now, assume _maybe_sub_sample for AR makes input_tokens = x0[:, :-1], output_tokens = x0[:, 1:]
-                # So, target is effectively x0[:, 1:]
-                 target_ar = x0[:, 1:input_tokens.shape[1]+1] # Target for x0[0] is x0[1], for x0[L-1] is x0[L]
-            else: # No subsampling or input_tokens is already x0[:,:-1]
+            if x0.shape[1] > input_tokens.shape[1]: 
+                 target_ar = x0[:, 1:input_tokens.shape[1]+1] 
+            else: 
                  target_ar = x0[:, 1:]
-
 
             if target_ar.shape[1] == 0: 
                  return Loss(loss=torch.tensor(0.0, device=x0.device, requires_grad=True), nlls=torch.zeros_like(input_tokens, dtype=torch.float32), token_mask=new_attention_mask)
@@ -1455,7 +1673,6 @@ class Diffusion(L.LightningModule):
             output_ar_matched = output_ar[:,:min_len_ar,:]
             target_ar_matched = target_ar[:,:min_len_ar]
             mask_ar = new_attention_mask[:, :min_len_ar]
-
 
             loss_ar = - output_ar_matched.gather(-1, target_ar_matched.unsqueeze(-1)).squeeze(-1)
             
@@ -1467,7 +1684,7 @@ class Diffusion(L.LightningModule):
                 _eps = torch.rand(input_tokens.shape[0], 1, device=input_tokens.device, dtype=torch.float32)
                 if self.antithetic_sampling:
                     offset = torch.arange(
-                        input_tokens.shape[0], device=input_tokens.device, dtype=torch.float32) / max(1,input_tokens.shape[0]) # Avoid div by zero
+                        input_tokens.shape[0], device=input_tokens.device, dtype=torch.float32) / max(1,input_tokens.shape[0]) 
                     _eps = (_eps / max(1,input_tokens.shape[0]) + offset[:, None]) % 1.0
                 t_for_loss = _eps * (current_sampling_eps_max - current_sampling_eps_min) + current_sampling_eps_min
             else: 
@@ -1524,26 +1741,26 @@ class Diffusion(L.LightningModule):
         for (eps_min_float, eps_max_float), var_list_cpu_tensors in self.metrics.valid_vars.items():
           if not var_list_cpu_tensors: continue 
           
-          var_list_cpu_tensors_on_cpu = [t.cpu() for t in var_list_cpu_tensors if t is not None and t.numel() > 0] # Filter None and empty
-          if not var_list_cpu_tensors_on_cpu: continue # Skip if list becomes empty after filtering
+          var_list_cpu_tensors_on_cpu = [t.cpu() for t in var_list_cpu_tensors if t is not None and t.numel() > 0] 
+          if not var_list_cpu_tensors_on_cpu: continue 
 
           all_vars_tensor_cpu = torch.cat(var_list_cpu_tensors_on_cpu, dim=0) 
-          if all_vars_tensor_cpu.numel() == 0: continue # Skip if concatenated tensor is empty
+          if all_vars_tensor_cpu.numel() == 0: continue 
 
           all_vars_tensor_device = all_vars_tensor_cpu.to(self.device)
           
           gathered_vars = self.all_gather(all_vars_tensor_device) 
 
           if isinstance(gathered_vars, list) and all(isinstance(t, torch.Tensor) for t in gathered_vars):
-            if not gathered_vars : continue # if list is empty after all_gather
-            gathered_vars_flat = torch.cat([gv.view(-1) for gv in gathered_vars if gv.numel() > 0]) # filter empty tensors before cat
+            if not gathered_vars : continue 
+            gathered_vars_flat = torch.cat([gv.view(-1) for gv in gathered_vars if gv.numel() > 0]) 
           elif isinstance(gathered_vars, torch.Tensor): 
             gathered_vars_flat = gathered_vars.view(-1)
           else: 
             print(f"Warning: Unexpected output from all_gather: {type(gathered_vars)}")
             continue
           
-          if gathered_vars_flat.numel() == 0: continue # Skip if empty after flattening
+          if gathered_vars_flat.numel() == 0: continue 
 
           if gathered_vars_flat.numel() > 1 : 
             current_total_variance = gathered_vars_flat.var()
@@ -1600,9 +1817,6 @@ class Diffusion(L.LightningModule):
             entropy[masked_indices] = pos_term - neg_term + const
         return entropy
     
-    # Methods from _analytic_sampler downwards remain largely unchanged from the previous version.
-    # Assuming they were correct or less impacted by the specific errors seen.
-    # They use other corrected methods like get_score, _sigma_from_p, etc.
     @torch.no_grad()
     def _analytic_sampler(
       self, n_samples, num_steps, seqlen, eps=1e-5):
@@ -1681,7 +1895,7 @@ class Diffusion(L.LightningModule):
           
           current_block_actual_end_in_accum = x_accum.shape[1]
           window_start = max(0, current_block_actual_end_in_accum - current_context_size_for_model)
-          x_model_input_window = x_accum[:, window_start:current_block_actual_end_in_accum]
+          # x_model_input_window = x_accum[:, window_start:current_block_actual_end_in_accum] # Not directly used as input to ddpm_update for bd3lm
           
           x_to_denoise_this_stride = x_accum[:, -current_block_gen_len:] 
 
@@ -1696,16 +1910,8 @@ class Diffusion(L.LightningModule):
 
             current_t_for_block = timesteps_for_block_ddpm[step_idx_in_block] * ones 
             
-            # The `x` passed to _ddpm_caching_update should be the current state of the block being refined.
-            # If BD3LM, this is x_to_denoise_this_stride.
-            # If other semi-ar, it's the relevant part of x_model_input_window.
-            # For simplicity, we assume x_to_denoise_this_stride is the primary target for _ddpm_caching_update.
-            # The `self.forward` call inside _ddpm_caching_update will get the right context (e.g. full x_model_input_window)
-            # if needed for non-kv_cache models, or just x_to_denoise_this_stride if kv_cache is on.
-            # This is a subtle part. Let's assume _ddpm_caching_update's `x` is the current version of what was `x_to_denoise_this_stride`.
-            
             p_x0_cache_block, x_to_denoise_this_stride_updated = self._ddpm_caching_update(
-                x=x_to_denoise_this_stride, # Pass the block being actively denoised
+                x=x_to_denoise_this_stride, 
                 t=current_t_for_block, 
                 dt=dt_per_step, 
                 p_x0=p_x0_cache_block)
@@ -1750,7 +1956,10 @@ class Diffusion(L.LightningModule):
                  denoised_logits = self.backbone(**final_denoise_input, timesteps=processed_final_sigma).logits
                  x_denoised_final_block = denoised_logits.argmax(-1)
             else: 
-                 x_denoised_final_block = self.backbone(**final_denoise_input, sigma=processed_final_sigma).argmax(-1)
+                 # Assuming custom backbone's forward is (indices, sigma)
+                 denoised_logits = self.backbone(final_denoise_input[backbone_input_arg_name_final], sigma=processed_final_sigma)
+                 x_denoised_final_block = denoised_logits.argmax(-1)
+
 
             x_accum[:, -x_to_denoise_this_stride.shape[1]:] = x_denoised_final_block 
         

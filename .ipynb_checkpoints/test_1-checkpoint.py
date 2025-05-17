@@ -57,7 +57,12 @@ class MockBackbone(nn.Module):
         self.dummy_embed = nn.Embedding(vocab_size, hidden_dim)
         self.fc = nn.Linear(hidden_dim, vocab_size) 
 
-    def forward(self, x_embeds, sigma, **kwargs): 
+    def forward(self, x_input_arg, sigma, **kwargs): # x_input_arg is the first positional argument
+        if x_input_arg.dtype == torch.long: # Assume it's token IDs
+            x_embeds = self.dummy_embed(x_input_arg)
+        else: # Assume it's already embeddings
+            x_embeds = x_input_arg
+            
         logits = self.fc(x_embeds) 
         return logits
 
@@ -73,18 +78,16 @@ class TestNewFeatures(unittest.TestCase):
     def setUpClass(cls):
         cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        cls.meta_controller_config_dict = {
+        # This dict should only contain parameters the MetaController class itself uses
+        cls.meta_controller_internal_config_dict = {
             'feature_dim': 1, 
             'hidden_dim': 32,
             's_tilde_squash_factor': 4.0,
             's_min_epsilon': 0.01,
-            'min_alpha_1_target': 0.005,
-            'lambda_min_alpha_1_penalty': 1.0,
-            'alpha_1_clamp_min': 1.0e-5,
-            'alpha_1_clamp_max': 0.99999,
         }
+        # This dict contains all algo-level parameters, including penalty-related ones
         cls.algo_config_dict = {
-            'meta_controller': cls.meta_controller_config_dict,
+            'meta_controller': cls.meta_controller_internal_config_dict, # Correctly nested
             'base_noise_type': 'cosine',
             'schedule_clamp_epsilon': 1.0e-6,
             'lambda_steps_penalty': 0.01,
@@ -99,9 +102,14 @@ class TestNewFeatures(unittest.TestCase):
             'cross_attn': False, 
             'sampler': 'semi_ar', 
             'mdlm_loss_scale': False, 
-            'clip_search_delta': 0.1, # Added default
-            'clip_search_widths': [0.5], # Added default
-            'fix_clipping': False, # Added default
+            'clip_search_delta': 0.1, 
+            'clip_search_widths': [0.5], 
+            'fix_clipping': False, 
+            # Keys for penalties, now correctly at the algo level
+            'min_alpha_1_target': 0.005,
+            'lambda_min_alpha_1_penalty': 1.0,
+            'alpha_1_clamp_min': 1.0e-5,
+            'alpha_1_clamp_max': 0.99999,
         }
         cls.model_config_dict = { 
             'length': 64, 
@@ -116,7 +124,7 @@ class TestNewFeatures(unittest.TestCase):
             'sampling_eps_min': 1e-3, 
             'sampling_eps_max': 1.0,   
             'sampling_eps': (1e-3, 1.0), 
-            'eval_nll': False, # Added default
+            'eval_nll': False, 
         }
         cls.eval_config_dict = { 
             'perplexity_batch_size':1, 
@@ -142,10 +150,10 @@ class TestNewFeatures(unittest.TestCase):
             'sampling': cls.sampling_config_dict, 
             'block_size': 16, 
             'vocab_size': cls.mock_tokenizer.vocab_size,
-            'data': {'tokenizer_name_or_path': 'mock', 'wrap': True}, # Added wrap for metrics init
-            'loader': {'eval_batch_size': 1}, # Added for metrics init
+            'data': {'tokenizer_name_or_path': 'mock', 'wrap': True}, 
+            'loader': {'eval_batch_size': 1}, 
             'noise': {
-                'type': 'cosine',
+                'type': 'cosine', # This 'type' is used by noise_schedule.get_noise(config)
                 'eps': 1e-3 
             }, 
             'eval': cls.eval_config_dict, 
@@ -160,7 +168,7 @@ class TestNewFeatures(unittest.TestCase):
             current_config = OmegaConf.merge(current_config, config_overrides)
         
         current_config_for_init = current_config.copy()
-        current_config_for_init.algo.backbone = 'hf_dit' 
+        # current_config_for_init.algo.backbone = 'hf_dit' # This is already set in cls.algo_config_dict
         if 'checkpoint_path' not in current_config_for_init.eval: 
              current_config_for_init.eval.checkpoint_path = "prajjwal1/bert-tiny"
 
@@ -171,7 +179,7 @@ class TestNewFeatures(unittest.TestCase):
             effective_length += current_config.model.length
             
         model.backbone = MockBackbone(
-            vocab_size=current_config.vocab_size,
+            vocab_size=current_config.vocab_size, # Use vocab_size from overall config
             hidden_dim=current_config.model.hidden_size,
             length=effective_length 
         ).to(self.device)
@@ -180,28 +188,31 @@ class TestNewFeatures(unittest.TestCase):
 
     def test_meta_controller(self):
         print("\nTesting MetaController...")
-        config = OmegaConf.create({'algo': {'meta_controller': self.meta_controller_config_dict}})
-        controller = MetaController(config).to(self.device)
-        B, N_Blk, FeatDim = 2, 4, config.algo.meta_controller.feature_dim
+        # For testing MetaController standalone, construct a config that matches its expectation
+        config_for_mc = OmegaConf.create({'algo': {'meta_controller': self.meta_controller_internal_config_dict}})
+        controller = MetaController(config_for_mc).to(self.device)
+        B, N_Blk, FeatDim = 2, 4, config_for_mc.algo.meta_controller.feature_dim
         block_features = torch.randn(B, N_Blk, FeatDim, device=self.device)
         log_s_tilde = controller(block_features)
         self.assertEqual(log_s_tilde.shape, (B, N_Blk, 1))
         s_b = controller.get_s_b(log_s_tilde)
         self.assertEqual(s_b.shape, (B, N_Blk, 1))
-        self.assertTrue(torch.all(s_b >= config.algo.meta_controller.s_min_epsilon))
+        self.assertTrue(torch.all(s_b >= config_for_mc.algo.meta_controller.s_min_epsilon))
         large_log_s_tilde = torch.full_like(log_s_tilde, 100.0) 
         s_b_max_tanh = controller.get_s_b(large_log_s_tilde)
-        expected_s_b_max_tanh = F.softplus(torch.tensor(1.0 * config.algo.meta_controller.s_tilde_squash_factor)) + config.algo.meta_controller.s_min_epsilon
+        expected_s_b_max_tanh = F.softplus(torch.tensor(1.0 * config_for_mc.algo.meta_controller.s_tilde_squash_factor)) + config_for_mc.algo.meta_controller.s_min_epsilon
         self.assertTrue(torch.allclose(s_b_max_tanh, expected_s_b_max_tanh.to(self.device), atol=1e-5))
         small_log_s_tilde = torch.full_like(log_s_tilde, -100.0) 
         s_b_min_tanh = controller.get_s_b(small_log_s_tilde)
-        expected_s_b_min_tanh = F.softplus(torch.tensor(-1.0 * config.algo.meta_controller.s_tilde_squash_factor)) + config.algo.meta_controller.s_min_epsilon
+        expected_s_b_min_tanh = F.softplus(torch.tensor(-1.0 * config_for_mc.algo.meta_controller.s_tilde_squash_factor)) + config_for_mc.algo.meta_controller.s_min_epsilon
         self.assertTrue(torch.allclose(s_b_min_tanh, expected_s_b_min_tanh.to(self.device), atol=1e-5))
         print("MetaController tests passed.")
 
     def test_noise_schedule_base_methods(self):
         print("\nTesting NoiseSchedule base methods (CosineNoise example)...")
         schedule_clamp_eps = self.algo_config_dict['schedule_clamp_epsilon']
+        # self.diffusion_config.noise.eps is used for the base_noise_schedule inside Diffusion
+        # For standalone testing, ensure we use the intended eps for CosineNoise
         base_schedule = noise_schedule.CosineNoise(eps=self.diffusion_config.noise.eps, schedule_clamp_epsilon=schedule_clamp_eps)
         base_schedule = base_schedule.to(self.device)
         t_vals = torch.tensor([0.0, 0.5, 1.0], device=self.device)
@@ -283,26 +294,32 @@ class TestNewFeatures(unittest.TestCase):
         print("\nTesting surrogate_steps_penalty...")
         B, N_Blk = 2, 3
         alpha_b_at_1 = torch.rand(B, N_Blk, 1, device=self.device) * 0.1 
-        cfg_mc = self.meta_controller_config_dict
+        
+        # Use values directly from cls.algo_config_dict as they are now correctly placed
+        min_alpha_1_target_val = self.algo_config_dict['min_alpha_1_target']
+        lambda_min_alpha_1_penalty_val = self.algo_config_dict['lambda_min_alpha_1_penalty']
+        alpha_1_clamp_min_val = self.algo_config_dict['alpha_1_clamp_min']
+        alpha_1_clamp_max_val = self.algo_config_dict['alpha_1_clamp_max']
+
         penalty = noise_schedule.compute_surrogate_steps_penalty(
-            alpha_b_at_1, cfg_mc['min_alpha_1_target'], cfg_mc['lambda_min_alpha_1_penalty'],
-            cfg_mc['alpha_1_clamp_min'], cfg_mc['alpha_1_clamp_max']
+            alpha_b_at_1, min_alpha_1_target_val, lambda_min_alpha_1_penalty_val,
+            alpha_1_clamp_min_val, alpha_1_clamp_max_val
         )
         self.assertEqual(penalty.shape, (B, N_Blk, 1))
-        alpha_b_at_1_violating_floor = torch.full_like(alpha_b_at_1, cfg_mc['min_alpha_1_target'] / 2)
+        alpha_b_at_1_violating_floor = torch.full_like(alpha_b_at_1, min_alpha_1_target_val / 2)
         penalty_violating = noise_schedule.compute_surrogate_steps_penalty(
-             alpha_b_at_1_violating_floor, cfg_mc['min_alpha_1_target'], cfg_mc['lambda_min_alpha_1_penalty'],
-             cfg_mc['alpha_1_clamp_min'], cfg_mc['alpha_1_clamp_max']
+             alpha_b_at_1_violating_floor, min_alpha_1_target_val, lambda_min_alpha_1_penalty_val,
+             alpha_1_clamp_min_val, alpha_1_clamp_max_val
         )
-        expected_log_term_violating = -torch.log(torch.clamp(alpha_b_at_1_violating_floor, min=cfg_mc['alpha_1_clamp_min']))
-        expected_floor_term = cfg_mc['lambda_min_alpha_1_penalty'] * (cfg_mc['min_alpha_1_target'] - cfg_mc['min_alpha_1_target']/2)**2
+        expected_log_term_violating = -torch.log(torch.clamp(alpha_b_at_1_violating_floor, min=alpha_1_clamp_min_val))
+        expected_floor_term = lambda_min_alpha_1_penalty_val * (min_alpha_1_target_val - min_alpha_1_target_val/2)**2
         self.assertTrue(torch.allclose(penalty_violating, expected_log_term_violating + expected_floor_term, atol=1e-5))
-        alpha_b_at_1_respecting_floor = torch.full_like(alpha_b_at_1, cfg_mc['min_alpha_1_target'] * 2)
+        alpha_b_at_1_respecting_floor = torch.full_like(alpha_b_at_1, min_alpha_1_target_val * 2)
         penalty_respecting = noise_schedule.compute_surrogate_steps_penalty(
-             alpha_b_at_1_respecting_floor, cfg_mc['min_alpha_1_target'], cfg_mc['lambda_min_alpha_1_penalty'],
-             cfg_mc['alpha_1_clamp_min'], cfg_mc['alpha_1_clamp_max']
+             alpha_b_at_1_respecting_floor, min_alpha_1_target_val, lambda_min_alpha_1_penalty_val,
+             alpha_1_clamp_min_val, alpha_1_clamp_max_val
         )
-        expected_log_term_respecting = -torch.log(torch.clamp(alpha_b_at_1_respecting_floor, min=cfg_mc['alpha_1_clamp_min']))
+        expected_log_term_respecting = -torch.log(torch.clamp(alpha_b_at_1_respecting_floor, min=alpha_1_clamp_min_val))
         self.assertTrue(torch.allclose(penalty_respecting, expected_log_term_respecting, atol=1e-5))
         print("Surrogate_steps_penalty tests passed.")
 
@@ -374,7 +391,6 @@ class TestNewFeatures(unittest.TestCase):
 
         B_stat_test, N_Tokens_stat_test = 8, 256 
         block_size_stat_test = self.diffusion_config.block_size 
-        # N_Blk_stat_test = N_Tokens_stat_test // block_size_stat_test # Not used directly here
         
         model_stat, config_stat = self._create_mock_diffusion_model({
             'model': {'length': N_Tokens_stat_test}, 
